@@ -9,22 +9,15 @@ MAX_REPORTS = 500
 
 @app.get("/")
 def home():
-return jsonify({
-"service": "PET Finder",
-"status": "online",
-"reports": len(reports)
-})
+return jsonify({"service": "PET Finder", "status": "online", "reports": len(reports)})
 
 @app.get("/reports")
 def get_reports():
 rarity = request.args.get("rarity", "").upper()
-
 with lock:
-    data = list(reports)
-
+data = list(reports)
 if rarity and rarity != "ALL":
-    data = [r for r in data if r["rarity"] == rarity]
-
+data = [r for r in data if r["rarity"] == rarity]
 return jsonify(data)
 
 @app.post("/reports")
@@ -32,23 +25,19 @@ def add_report():
 data = request.get_json(silent=True) or {}
 name = str(data.get("name", "")).strip()[:100]
 rarity = str(data.get("rarity", "UNKNOWN")).upper()[:30]
-
 if not name:
-    return jsonify({"error": "Missing egg name"}), 400
-
+return jsonify({"error": "Missing egg name"}), 400
 report = {
-    "name": name,
-    "rarity": rarity,
-    "weight": data.get("weight"),
-    "income": data.get("income"),
-    "server_id": data.get("server_id"),
-    "created_at": datetime.now(timezone.utc).isoformat()
+"name": name,
+"rarity": rarity,
+"weight": data.get("weight"),
+"income": data.get("income"),
+"server_id": data.get("server_id"),
+"created_at": datetime.now(timezone.utc).isoformat()
 }
-
 with lock:
-    reports.insert(0, report)
-    del reports[MAX_REPORTS:]
-
+reports.insert(0, report)
+del reports[MAX_REPORTS:]
 return jsonify({"ok": True, "report": report}), 201
 
 @app.get("/test-report")
@@ -61,11 +50,9 @@ report = {
 "server_id": "TEST-123",
 "created_at": datetime.now(timezone.utc).isoformat()
 }
-
 with lock:
-    reports.insert(0, report)
-    del reports[MAX_REPORTS:]
-
+reports.insert(0, report)
+del reports[MAX_REPORTS:]
 return jsonify({"ok": True, "report": report})
 
 if name == "main":
