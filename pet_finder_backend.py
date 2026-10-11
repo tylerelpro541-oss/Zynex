@@ -64,8 +64,9 @@ report = {
 
 with lock:
     reports.insert(0, report)
+    del reports[MAX_REPORTS:]
 
-return jsonify({"ok": True})
+return jsonify({"ok": True, "report": report})
 
 if name == "main":
 app.run(host="0.0.0.0", port=10000)
