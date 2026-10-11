@@ -1,8 +1,11 @@
+
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from datetime import datetime, timezone
 from threading import Lock
 
 app = Flask(__name__)
+CORS(app)
 
 reports = []
 lock = Lock()
@@ -12,30 +15,37 @@ MAX_REPORTS = 500
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "service": "PET Finder",
+        "service": "PET Finder Zynex",
         "status": "online",
         "reports": len(reports)
     })
 
 
-@app.route("/reports", methods=["GET"])
+@app.route("/reports", methods=["GET", "OPTIONS"])
 def get_reports():
-    rarity = request.args.get("rarity", "").upper()
+    rarity = request.args.get("rarity", "ALL").upper()
 
     with lock:
         data = list(reports)
 
-    if rarity and rarity != "ALL":
+    if rarity != "ALL":
         data = [
             report for report in data
             if report["rarity"] == rarity
         ]
 
-    return jsonify(data)
+    return jsonify({
+        "ok": True,
+        "count": len(data),
+        "reports": data
+    })
 
 
-@app.route("/reports", methods=["POST"])
+@app.route("/reports", methods=["POST", "OPTIONS"])
 def add_report():
+    if request.method == "OPTIONS":
+        return "", 204
+
     data = request.get_json(silent=True) or {}
 
     name = str(data.get("name", "")).strip()[:100]
@@ -86,3 +96,4 @@ def test_report():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+    
