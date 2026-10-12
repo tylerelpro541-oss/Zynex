@@ -14,15 +14,21 @@ MAX_REPORTS = 500
 
 @app.route("/", methods=["GET"])
 def home():
+    with lock:
+        count = len(reports)
+
     return jsonify({
         "service": "PET Finder Zynex",
         "status": "online",
-        "reports": len(reports)
+        "reports": count
     })
 
 
 @app.route("/reports", methods=["GET", "OPTIONS"])
 def get_reports():
+    if request.method == "OPTIONS":
+        return "", 204
+
     rarity = request.args.get("rarity", "ALL").upper()
 
     with lock:
@@ -50,6 +56,7 @@ def add_report():
 
     name = str(data.get("name", "")).strip()[:100]
     rarity = str(data.get("rarity", "UNKNOWN")).upper()[:30]
+    biome = str(data.get("biome", "Desconocido")).strip()[:100]
 
     if not name:
         return jsonify({"error": "Missing egg name"}), 400
@@ -57,9 +64,10 @@ def add_report():
     report = {
         "name": name,
         "rarity": rarity,
+        "biome": biome or "Desconocido",
         "weight": data.get("weight"),
         "income": data.get("income"),
-        "server_id": data.get("server_id"),
+        "server_id": str(data.get("server_id", ""))[:100],
         "created_at": datetime.now(timezone.utc).isoformat()
     }
 
@@ -78,6 +86,7 @@ def test_report():
     report = {
         "name": "Huevo de prueba",
         "rarity": "SECRET",
+        "biome": "Cherry Blossom 🌸",
         "weight": 250,
         "income": 1000,
         "server_id": "TEST-123",
