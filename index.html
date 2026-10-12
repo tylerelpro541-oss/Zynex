@@ -1,4 +1,6 @@
-<!DOCTYPE html><html lang="es">
+
+<!DOCTYPE html>
+<html lang="es">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -13,7 +15,6 @@ label{display:block;color:#ff83ca;margin-bottom:8px}
 select,button{width:100%;padding:13px;border-radius:9px;border:0;font-size:15px;margin:5px 0}
 select{background:#292936;color:white}
 button{background:#e83e9d;color:white;font-weight:bold}
-button:active{opacity:.8}
 #status{color:#ff9ad5;overflow-wrap:anywhere}
 .egg{padding:12px;margin:10px 0;background:#242431;border-radius:10px;border-left:4px solid #ff55b5}
 .name{font-weight:bold;font-size:17px}
@@ -23,7 +24,9 @@ footer{text-align:center;color:#777;font-size:12px;margin:22px 0}
 </head>
 <body>
 <header>💗 PET FINDER ZYNEX</header>
-<div class="subtitle">Buscador de reportes de huevos</div><div class="panel">
+<div class="subtitle">Buscador de reportes de huevos</div>
+
+<div class="panel">
 <label for="rarity">FILTRAR POR RAREZA</label>
 <select id="rarity">
 <option>ALL</option>
@@ -33,31 +36,55 @@ footer{text-align:center;color:#777;font-size:12px;margin:22px 0}
 </select>
 <button id="refresh">🔎 ACTUALIZAR REPORTES</button>
 <p id="status">Preparado para conectar con Zynex.</p>
-</div><div class="panel">
+</div>
+
+<div class="panel">
 <strong>🥚 REPORTES ENCONTRADOS</strong>
 <div id="results">Pulsa actualizar reportes.</div>
-</div><footer>Los reportes de prueba no son huevos reales.</footer><script>
+</div>
+
+<footer>Los reportes de prueba no son huevos reales.</footer>
+
+<script>
 const API = "https://zynex-kf4o.onrender.com/reports";
 const statusEl = document.getElementById("status");
 const resultsEl = document.getElementById("results");
 const rarityEl = document.getElementById("rarity");
 
-async function refreshReports(){
+async function refreshReports() {
   statusEl.textContent = "Conectando con Render...";
   resultsEl.textContent = "";
+
   try {
     const response = await fetch(API);
-    if (!response.ok) throw new Error("HTTP " + response.status);
-    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error("Error HTTP " + response.status);
+    }
+
+    const result = await response.json();
+
+    // Acepta una lista o un objeto con la propiedad reports.
+    if (Array.isArray(result)) {
+      var reports = result;
+    } else if (result && Array.isArray(result.reports)) {
+      var reports = result.reports;
+    } else {
+      throw new Error("Formato de respuesta inesperado");
+    }
+
     const selected = rarityEl.value;
     const filtered = selected === "ALL"
-      ? data
-      : data.filter(x => String(x.rarity).toUpperCase() === selected);
+      ? reports
+      : reports.filter(item =>
+          String(item.rarity || "").toUpperCase() === selected
+        );
 
-    statusEl.textContent = "Conexión correcta · Reportes: " + filtered.length;
+    statusEl.textContent =
+      "Conexión correcta · Reportes: " + filtered.length;
 
-    if (!filtered.length) {
-      resultsEl.textContent = "No hay reportes para este filtro.";
+    if (filtered.length === 0) {
+      resultsEl.textContent = "No hay reportes guardados para este filtro.";
       return;
     }
 
@@ -80,14 +107,18 @@ async function refreshReports(){
       card.append(name, meta);
       resultsEl.appendChild(card);
     });
+
   } catch (error) {
-    statusEl.textContent = "No se pudo conectar desde la página.";
+    statusEl.textContent = "Error: " + error.message;
     resultsEl.textContent =
-      "Comprueba que Render esté disponible. Si aparece un error de CORS, habrá que configurar el servidor.";
+      "No se pudieron cargar los reportes. Revisa la conexión con Render.";
   }
 }
 
-document.getElementById("refresh").addEventListener("click", refreshReports);
+document.getElementById("refresh")
+  .addEventListener("click", refreshReports);
+
 rarityEl.addEventListener("change", refreshReports);
-</script></body>
+</script>
+</body>
 </html>
