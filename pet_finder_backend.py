@@ -1,6 +1,5 @@
 
 import os
-import time
 import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -18,7 +17,9 @@ def get_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL no configurada")
     return psycopg2.connect(
-        DATABASE_URL, connect_timeout=8, sslmode="require"
+        DATABASE_URL,
+        connect_timeout=8,
+        sslmode="require"
     )
 
 
@@ -56,13 +57,19 @@ def init_db():
 def json_row(row):
     if not row:
         return None
+
     result = dict(row)
-    if result.get("created_at"):
-        result["created_at"] = result["created_at"].isoformat()
-    if result.get("updated_at"):
-        result["updated_at"] = result["updated_at"].isoformat()
-    result["weight_kg"] = result.get("weight")
-    result["income_per_second"] = result.get("income")
+
+    for key in ("created_at", "updated_at", "last_seen"):
+        if result.get(key):
+            result[key] = result[key].isoformat()
+
+    if "weight" in result:
+        result["weight_kg"] = result.get("weight")
+
+    if "income" in result:
+        result["income_per_second"] = result.get("income")
+
     return result
 
 
@@ -72,7 +79,12 @@ def home():
         "ok": True,
         "service": "ZYNEX Pet Finder API",
         "storage": "postgresql",
-        "features": ["reports", "servers", "health", "public_servers"]
+        "features": [
+            "reports",
+            "servers",
+            "health",
+            "public_servers"
+        ]
     })
 
 
@@ -82,10 +94,17 @@ def health():
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
-        return jsonify({"ok": True, "database": "connected"})
+
+        return jsonify({
+            "ok": True,
+            "database": "connected"
+        })
     except Exception:
         app.logger.exception("Health check failed")
-        return jsonify({"ok": False, "database": "error"}), 503
+        return jsonify({
+            "ok": False,
+            "database": "error"
+        }), 503
 
 
 @app.route("/reports", methods=["GET", "POST", "OPTIONS"])
@@ -96,8 +115,12 @@ def reports():
     if request.method == "POST":
         data = request.get_json(silent=True) or {}
         name = str(data.get("name") or "").strip()
+
         if not name:
-            return jsonify({"ok": False, "error": "name obligatorio"}), 400
+            return jsonify({
+                "ok": False,
+                "error": "name obligatorio"
+            }), 400
 
         def to_number(value):
             try:
@@ -116,29 +139,56 @@ def reports():
                     """, (
                         name[:200],
                         str(data.get("rarity") or "")[:50],
-                        to_number(data.get("weight_kg", data.get("weight"))),
-                        to_number(data.get("income_per_second", data.get("income"))),
+                        to_number(data.get(
+                            "weight_kg",
+                            data.get("weight")
+                        )),
+                        to_number(data.get(
+                            "income_per_second",
+                            data.get("income")
+                        )),
                         str(data.get("server_id") or "")[:200],
                         str(data.get("area") or "")[:200]
                     ))
+
                     saved = json_row(cur.fetchone())
-            return jsonify({"ok": True, "report": saved}), 201
+
+            return jsonify({
+                "ok": True,
+                "report": saved
+            }), 201
+
         except Exception:
             app.logger.exception("Saving report failed")
-            return jsonify({"ok": False, "error": "No se pudo guardar"}), 503
+            return jsonify({
+                "ok": False,
+                "error": "No se pudo guardar"
+            }), 503
 
-    limit = max(1, min(request.args.get("limit", 100, type=int), 500))
+    limit = max(
+        1,
+        min(request.args.get("limit", 100, type=int), 500)
+    )
+
     try:
         with get_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
                     SELECT * FROM egg_reports
-                    ORDER BY created_at DESC LIMIT %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
                 """, (limit,))
-                return jsonify([json_row(r) for r in cur.fetchall()])
+
+                rows = [json_row(r) for r in cur.fetchall()]
+
+        return jsonify(rows)
+
     except Exception:
         app.logger.exception("Loading reports failed")
-        return jsonify({"ok": False, "error": "No se pudieron leer"}), 503
+        return jsonify({
+            "ok": False,
+            "error": "No se pudieron leer los reportes"
+        }), 503
 
 
 @app.get("/servers")
@@ -147,97 +197,139 @@ def servers():
         with get_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
-                    SELECT server_id,
-                           COUNT(DISTINCT name) AS egg_types,
-                           COUNT(*) AS report_count,
-                           MAX(created_at) AS last_seen
+                    SELECT
+                        server_id,
+                        COUNT(DISTINCT name) AS egg_types,
+                        COUNT(*) AS report_count,
+                        MAX(created_at) AS last_seen
                     FROM egg_reports
-                    WHERE server_id IS NOT NULL AND server_id <> ''
+                    WHERE server_id IS NOT NULL
+                      AND server_id <> ''
                     GROUP BY server_id
                     ORDER BY MAX(created_at) DESC
                     LIMIT 200
                 """)
-                rows = []
-                for row in cur.fetchall():
-                    item = dict(row)
-                    if item.get("last_seen"):
-                        item["last_seen"] = item["last_seen"].isoformat()
-                    rows.append(item)
+
+                rows = [json_row(r) for r in cur.fetchall()]
+
         return jsonify({
             "ok": True,
             "servers": rows,
             "servers_count": len(rows)
         })
+
     except Exception:
         app.logger.exception("Loading servers failed")
-        return jsonify({"ok": False, "error": "No se pudieron leer servidores"}), 503
+        return jsonify({
+            "ok": False,
+            "error": "No se pudieron leer servidores"
+        }), 503
 
 
 @app.get("/sync-public-servers")
 def sync_public_servers():
-    # Máximo 100 servidores por ejecución.
-    pages = max(1, min(request.args.get("pages", 1, type=int), 1))
-    url = f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
-    cursor = None
-    saved_count = 0
+    url = (
+        f"https://games.roblox.com/v1/games/"
+        f"{PLACE_ID}/servers/Public"
+    )
 
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                for _ in range(pages):
-                    params = {"sortOrder": "Asc", "limit": 100}
-                    if cursor:
-                        params["cursor"] = cursor
+                response = requests.get(
+                    url,
+                    params={
+                        "sortOrder": "Asc",
+                        "limit": 100
+                    },
+                    timeout=20,
+                    headers={
+                        "User-Agent": "Mozilla/5.0",
+                        "Accept": "application/json"
+                    }
+                )
 
-                    response = requests.get(
-                        url, params=params, timeout=15,
-                        headers={"User-Agent": "ZYNEX-Public-Server-Sync"}
+                if response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After")
+
+                    app.logger.warning(
+                        "Roblox rate limit 429; Retry-After=%s",
+                        retry_after
                     )
-                    response.raise_for_status()
-                    payload = response.json()
 
-                    for server in payload.get("data", []):
-                        server_id = server.get("id")
-                        if not server_id:
-                            continue
-                        cur.execute("""
-                            INSERT INTO public_servers
-                                (place_id, server_id, playing, max_players, updated_at)
-                            VALUES (%s, %s, %s, %s, NOW())
-                            ON CONFLICT (place_id, server_id)
-                            DO UPDATE SET
-                                playing = EXCLUDED.playing,
-                                max_players = EXCLUDED.max_players,
-                                updated_at = NOW()
-                        """, (
-                            PLACE_ID,
-                            str(server_id),
-                            int(server.get("playing") or 0),
-                            int(server.get("maxPlayers") or 0)
-                        ))
-                        saved_count += 1
+                    return jsonify({
+                        "ok": False,
+                        "error": (
+                            "Roblox está limitando las peticiones. "
+                            "Espera antes de volver a intentar."
+                        ),
+                        "retry_after": retry_after
+                    }), 429
 
-                    cursor = payload.get("nextPageCursor")
-                    if not cursor:
-                        break
+                response.raise_for_status()
+                payload = response.json()
+                saved_count = 0
+
+                for server in payload.get("data", []):
+                    server_id = server.get("id")
+
+                    if not server_id:
+                        continue
+
+                    cur.execute("""
+                        INSERT INTO public_servers
+                            (place_id, server_id, playing,
+                             max_players, updated_at)
+                        VALUES (%s, %s, %s, %s, NOW())
+                        ON CONFLICT (place_id, server_id)
+                        DO UPDATE SET
+                            playing = EXCLUDED.playing,
+                            max_players = EXCLUDED.max_players,
+                            updated_at = NOW()
+                    """, (
+                        PLACE_ID,
+                        str(server_id),
+                        int(server.get("playing") or 0),
+                        int(server.get("maxPlayers") or 0)
+                    ))
+
+                    saved_count += 1
 
         return jsonify({
             "ok": True,
             "saved_or_updated": saved_count,
             "max_per_run": 100,
-            "note": "Son IDs públicos guardados; esto no detecta huevos."
+            "note": (
+                "Se guardaron IDs públicos. "
+                "Esto no detecta los huevos de esos servidores."
+            )
         })
+
+    except requests.exceptions.HTTPError:
+        app.logger.exception("Roblox API HTTP error")
+        return jsonify({
+            "ok": False,
+            "error": (
+                "Roblox rechazó la petición. "
+                "Si es 429, espera antes de reintentar."
+            )
+        }), 502
+
     except Exception:
         app.logger.exception("Public server sync failed")
         return jsonify({
             "ok": False,
-            "error": "No se pudieron sincronizar los servidores públicos"
+            "error": "Falló la sincronización. Revisa los logs."
         }), 502
 
 
 @app.get("/public-servers")
 def public_servers():
-    limit = max(1, min(request.args.get("limit", 100, type=int), 100))
+    limit = max(
+        1,
+        min(request.args.get("limit", 100, type=int), 100)
+    )
+
     try:
         with get_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -245,26 +337,36 @@ def public_servers():
                     SELECT server_id, playing, max_players, updated_at
                     FROM public_servers
                     WHERE place_id = %s
-                    ORDER BY playing ASC, updated_at DESC
+                    ORDER BY updated_at DESC
                     LIMIT %s
                 """, (PLACE_ID, limit))
+
                 rows = [json_row(r) for r in cur.fetchall()]
+
         return jsonify({
             "ok": True,
             "servers_count": len(rows),
             "servers": rows
         })
+
     except Exception:
         app.logger.exception("Loading public servers failed")
-        return jsonify({"ok": False, "error": "No se pudieron leer IDs"}), 503
+        return jsonify({
+            "ok": False,
+            "error": "No se pudieron leer los IDs"
+        }), 503
 
 
 try:
     init_db()
+    app.logger.info("ZYNEX database initialized")
 except Exception:
     app.logger.exception("Database initialization failed")
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
-                    
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "10000"))
+        )
+                
