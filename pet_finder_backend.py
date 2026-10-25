@@ -1,25 +1,23 @@
-
 import os
+import time
 import requests
 import psycopg2
-from psycopg2.extras import RealDictCursor
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from psycopg2.extras import RealDictCursor
 
 app = Flask(__name__)
 CORS(app)
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 PLACE_ID = "107778070777162"
-ROBLOX_API = (
-    f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
-)
+ROBLOX_API = f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
 MAX_PAGES = 8
 
 
 def get_conn():
     if not DATABASE_URL:
-        raise RuntimeError("Falta la variable DATABASE_URL")
+        raise RuntimeError("Falta DATABASE_URL en Render")
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 
@@ -65,13 +63,13 @@ def home():
                     "SELECT COUNT(*) FROM public_servers WHERE place_id = %s",
                     (PLACE_ID,)
                 )
-                public_count = cur.fetchone()[0]
+                servers_count = cur.fetchone()[0]
 
         return jsonify({
             "service": "PET Finder | ZYNEX",
             "status": "online",
             "reports": reports_count,
-            "public_servers_saved": public_count,
+            "public_servers_saved": servers_count,
             "place_id": PLACE_ID
         })
     except Exception as e:
@@ -125,7 +123,7 @@ def reports():
         return jsonify({"ok": True, "id": report_id}), 201
 
     rarity = request.args.get("rarity", "ALL").upper()
-    limit = min(max(request.args.get("limit", default=100, type=int), 1), 500)
+    limit = min(max(request.args.get("limit", 100, type=int), 1), 500)
 
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -165,8 +163,7 @@ def servers():
                        COUNT(DISTINCT name) AS egg_types,
                        MAX(created_at) AS last_seen
                 FROM egg_reports
-                WHERE server_id IS NOT NULL
-                  AND server_id <> ''
+                WHERE server_id IS NOT NULL AND server_id <> ''
                 GROUP BY server_id
                 ORDER BY MAX(created_at) DESC
                 LIMIT 500
@@ -191,38 +188,56 @@ def sync_public_servers():
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                for _ in range(MAX_PAGES):
+                for page in range(MAX_PAGES):
                     params = {
                         "sortOrder": "Desc",
                         "limit": 100
                     }
-
                     if cursor_token:
                         params["cursor"] = cursor_token
 
-                    response = requests.get(
-                        ROBLOX_API,
-                        params=params,
-                        timeout=25,
-                        headers={"User-Agent": "ZYNEX-PET-Finder"}
-                    )
+                    response = None
 
-                    if response.status_code != 200:
+                    for attempt in range(5):
+                        response = requests.get(
+                            ROBLOX_API,
+                            params=params,
+                            timeout=30,
+                            headers={"User-Agent": "Mozilla/5.0"}
+                        )
+
+                        if response.status_code != 429:
+                            break
+
+                        retry_after = response.headers.get("Retry-After")
+                        try:
+                            wait = (
+                                min(int(retry_after), 60)
+                                if retry_after
+                                else min(5 * (2 ** attempt), 60)
+                            )
+                        except (ValueError, TypeError):
+                            wait = min(5 * (2 ** attempt), 60)
+
+                        time.sleep(wait)
+
+                    if response is None or response.status_code != 200:
+                        conn.rollback()
                         return jsonify({
                             "ok": False,
-                            "error": "Roblox no devolvió una página válida",
-                            "http_status": response.status_code,
+                            "error": "Roblox limitó o rechazó la solicitud",
+                            "http_status": response.status_code if response else None,
                             "pages_read": pages_read,
                             "total_seen": total_seen,
                             "saved_or_updated": saved_or_updated
                         }), 502
 
                     payload = response.json()
-                    page_data = payload.get("data", [])
+                    server_list = payload.get("data", [])
                     pages_read += 1
-                    total_seen += len(page_data)
+                    total_seen += len(server_list)
 
-                    for server in page_data:
+                    for server in server_list:
                         server_id = server.get("id")
                         if not server_id:
                             continue
@@ -251,6 +266,7 @@ def sync_public_servers():
 
                     seen_cursors.add(next_cursor)
                     cursor_token = next_cursor
+                    time.sleep(2)
 
         return jsonify({
             "ok": True,
@@ -258,23 +274,16 @@ def sync_public_servers():
             "pages_read": pages_read,
             "total_seen": total_seen,
             "saved_or_updated": saved_or_updated,
-            "message": "Se sincronizaron los servidores públicos."
+            "message": "Sincronización terminada"
         })
 
-    except requests.RequestException as e:
-        return jsonify({
-            "ok": False,
-            "error": "Error al conectar con Roblox",
-            "details": str(e),
-            "pages_read": pages_read,
-            "saved_or_updated": saved_or_updated
-        }), 502
     except Exception as e:
-        app.logger.exception("Error sincronizando servidores públicos")
+        app.logger.exception("Error sincronizando servidores")
         return jsonify({
             "ok": False,
             "error": str(e),
             "pages_read": pages_read,
+            "total_seen": total_seen,
             "saved_or_updated": saved_or_updated
         }), 500
 
@@ -314,4 +323,8 @@ with app.app_context():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000))
+        )
+    
