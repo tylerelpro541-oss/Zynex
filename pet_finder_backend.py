@@ -11,8 +11,9 @@ CORS(app)
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 PLACE_ID = "107778070777162"
-ROBLOX_API = f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
-MAX_PAGES = 8
+ROBLOX_API = (
+    f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
+)
 
 
 def get_conn():
@@ -50,6 +51,20 @@ def init_db():
                     PRIMARY KEY (place_id, server_id)
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS public_server_sync_state (
+                    place_id TEXT PRIMARY KEY,
+                    next_cursor TEXT,
+                    pages_read INTEGER NOT NULL DEFAULT 0,
+                    total_seen BIGINT NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                INSERT INTO public_server_sync_state (place_id)
+                VALUES (%s)
+                ON CONFLICT (place_id) DO NOTHING
+            """, (PLACE_ID,))
 
 
 @app.route("/")
@@ -58,21 +73,22 @@ def home():
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT COUNT(*) FROM egg_reports")
-                reports_count = cur.fetchone()[0]
-                cur.execute(
-                    "SELECT COUNT(*) FROM public_servers WHERE place_id = %s",
-                    (PLACE_ID,)
-                )
-                servers_count = cur.fetchone()[0]
+                report_count = cur.fetchone()[0]
+                cur.execute("""
+                    SELECT COUNT(*) FROM public_servers
+                    WHERE place_id = %s
+                """, (PLACE_ID,))
+                server_count = cur.fetchone()[0]
 
         return jsonify({
             "service": "PET Finder | ZYNEX",
             "status": "online",
-            "reports": reports_count,
-            "public_servers_saved": servers_count,
+            "reports": report_count,
+            "public_servers_saved": server_count,
             "place_id": PLACE_ID
         })
     except Exception as e:
+        app.logger.exception("Home error")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -130,8 +146,8 @@ def reports():
             if rarity == "ALL":
                 cur.execute("""
                     SELECT id, name, rarity, weight,
-                           weight AS weight_kg,
-                           income, income AS income_per_second,
+                           weight AS weight_kg, income,
+                           income AS income_per_second,
                            server_id, area, created_at
                     FROM egg_reports
                     ORDER BY created_at DESC
@@ -140,8 +156,8 @@ def reports():
             else:
                 cur.execute("""
                     SELECT id, name, rarity, weight,
-                           weight AS weight_kg,
-                           income, income AS income_per_second,
+                           weight AS weight_kg, income,
+                           income AS income_per_second,
                            server_id, area, created_at
                     FROM egg_reports
                     WHERE UPPER(rarity) = %s
@@ -179,113 +195,151 @@ def servers():
 
 @app.route("/sync-public-servers", methods=["GET", "POST"])
 def sync_public_servers():
-    cursor_token = None
-    seen_cursors = set()
-    pages_read = 0
-    total_seen = 0
-    saved_or_updated = 0
-
+    # Cada llamada procesa solamente una página.
+    # El cursor queda guardado en PostgreSQL para continuar
+    # en la siguiente llamada, incluso tras reiniciar Render.
     try:
         with get_conn() as conn:
-            with conn.cursor() as cur:
-                for page in range(MAX_PAGES):
-                    params = {
-                        "sortOrder": "Desc",
-                        "limit": 100
-                    }
-                    if cursor_token:
-                        params["cursor"] = cursor_token
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT next_cursor, pages_read, total_seen
+                    FROM public_server_sync_state
+                    WHERE place_id = %s
+                    FOR UPDATE
+                """, (PLACE_ID,))
+                state = cur.fetchone()
 
-                    response = None
+                if state is None:
+                    cur.execute("""
+                        INSERT INTO public_server_sync_state (place_id)
+                        VALUES (%s)
+                        ON CONFLICT (place_id) DO NOTHING
+                    """, (PLACE_ID,))
+                    cursor_token = None
+                    pages_read = 0
+                    total_seen = 0
+                else:
+                    cursor_token = state["next_cursor"]
+                    pages_read = state["pages_read"]
+                    total_seen = state["total_seen"]
 
-                    for attempt in range(5):
-                        response = requests.get(
-                            ROBLOX_API,
-                            params=params,
-                            timeout=30,
-                            headers={"User-Agent": "Mozilla/5.0"}
-                        )
+                params = {"sortOrder": "Desc", "limit": 100}
+                if cursor_token:
+                    params["cursor"] = cursor_token
 
-                        if response.status_code != 429:
-                            break
+                response = requests.get(
+                    ROBLOX_API,
+                    params=params,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=15
+                )
 
-                        retry_after = response.headers.get("Retry-After")
-                        try:
-                            wait = (
-                                min(int(retry_after), 60)
-                                if retry_after
-                                else min(5 * (2 ** attempt), 60)
-                            )
-                        except (ValueError, TypeError):
-                            wait = min(5 * (2 ** attempt), 60)
+                if response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After")
+                    try:
+                        retry_seconds = int(retry_after) if retry_after else 60
+                    except (TypeError, ValueError):
+                        retry_seconds = 60
 
-                        time.sleep(wait)
+                    return jsonify({
+                        "ok": False,
+                        "error": "Roblox está limitando las solicitudes",
+                        "http_status": 429,
+                        "retry_after_seconds": retry_seconds,
+                        "pages_read": pages_read,
+                        "total_seen": total_seen
+                    }), 429
 
-                    if response is None or response.status_code != 200:
-                        conn.rollback()
-                        return jsonify({
-                            "ok": False,
-                            "error": "Roblox limitó o rechazó la solicitud",
-                            "http_status": response.status_code if response else None,
-                            "pages_read": pages_read,
-                            "total_seen": total_seen,
-                            "saved_or_updated": saved_or_updated
-                        }), 502
+                if response.status_code != 200:
+                    return jsonify({
+                        "ok": False,
+                        "error": "Roblox rechazó la solicitud",
+                        "http_status": response.status_code,
+                        "pages_read": pages_read,
+                        "total_seen": total_seen
+                    }), 502
 
-                    payload = response.json()
-                    server_list = payload.get("data", [])
-                    pages_read += 1
-                    total_seen += len(server_list)
+                payload = response.json()
+                server_list = payload.get("data", [])
+                next_cursor = payload.get("nextPageCursor")
 
-                    for server in server_list:
-                        server_id = server.get("id")
-                        if not server_id:
-                            continue
+                saved = 0
+                for server in server_list:
+                    server_id = server.get("id")
+                    if not server_id:
+                        continue
 
-                        cur.execute("""
-                            INSERT INTO public_servers
-                                (place_id, server_id, playing,
-                                 max_players, updated_at)
-                            VALUES (%s, %s, %s, %s, NOW())
-                            ON CONFLICT (place_id, server_id)
-                            DO UPDATE SET
-                                playing = EXCLUDED.playing,
-                                max_players = EXCLUDED.max_players,
-                                updated_at = NOW()
-                        """, (
-                            PLACE_ID,
-                            server_id,
-                            server.get("playing", 0),
-                            server.get("maxPlayers", 0)
-                        ))
-                        saved_or_updated += 1
+                    cur.execute("""
+                        INSERT INTO public_servers
+                            (place_id, server_id, playing,
+                             max_players, updated_at)
+                        VALUES (%s, %s, %s, %s, NOW())
+                        ON CONFLICT (place_id, server_id)
+                        DO UPDATE SET
+                            playing = EXCLUDED.playing,
+                            max_players = EXCLUDED.max_players,
+                            updated_at = NOW()
+                    """, (
+                        PLACE_ID,
+                        server_id,
+                        server.get("playing", 0),
+                        server.get("maxPlayers", 0)
+                    ))
+                    saved += 1
 
-                    next_cursor = payload.get("nextPageCursor")
-                    if not next_cursor or next_cursor in seen_cursors:
-                        break
+                pages_read += 1
+                total_seen += len(server_list)
 
-                    seen_cursors.add(next_cursor)
-                    cursor_token = next_cursor
-                    time.sleep(2)
+                # Cuando termina una vuelta, la siguiente comienza
+                # desde la primera página.
+                if not next_cursor:
+                    cur.execute("""
+                        UPDATE public_server_sync_state
+                        SET next_cursor = NULL,
+                            pages_read = 0,
+                            total_seen = 0,
+                            updated_at = NOW()
+                        WHERE place_id = %s
+                    """, (PLACE_ID,))
+                    finished = True
+                else:
+                    cur.execute("""
+                        UPDATE public_server_sync_state
+                        SET next_cursor = %s,
+                            pages_read = %s,
+                            total_seen = %s,
+                            updated_at = NOW()
+                        WHERE place_id = %s
+                    """, (
+                        next_cursor,
+                        pages_read,
+                        total_seen,
+                        PLACE_ID
+                    ))
+                    finished = False
 
         return jsonify({
             "ok": True,
             "place_id": PLACE_ID,
-            "pages_read": pages_read,
-            "total_seen": total_seen,
-            "saved_or_updated": saved_or_updated,
-            "message": "Sincronización terminada"
+            "pages_read_this_request": 1,
+            "servers_in_this_page": len(server_list),
+            "saved_or_updated": saved,
+            "pages_in_cycle": pages_read if not finished else 0,
+            "total_seen_in_cycle": total_seen if not finished else len(server_list),
+            "more_pages": bool(next_cursor),
+            "cycle_finished": finished
         })
 
-    except Exception as e:
-        app.logger.exception("Error sincronizando servidores")
+    except requests.RequestException as e:
+        app.logger.warning("Roblox request failed: %s", e)
         return jsonify({
             "ok": False,
-            "error": str(e),
-            "pages_read": pages_read,
-            "total_seen": total_seen,
-            "saved_or_updated": saved_or_updated
-        }), 500
+            "error": "No se pudo conectar con Roblox",
+            "details": str(e)
+        }), 502
+    except Exception as e:
+        app.logger.exception("Public server sync failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/public-servers")
@@ -301,7 +355,7 @@ def public_servers():
                 FROM public_servers
                 WHERE place_id = %s
                   AND playing BETWEEN %s AND %s
-                ORDER BY playing DESC, updated_at DESC
+                ORDER BY updated_at DESC
                 LIMIT %s
             """, (PLACE_ID, min_players, max_players, limit))
             rows = cur.fetchall()
@@ -309,11 +363,11 @@ def public_servers():
     return jsonify({
         "ok": True,
         "place_id": PLACE_ID,
+        "count": len(rows),
         "filter": {
             "min_players": min_players,
             "max_players": max_players
         },
-        "count": len(rows),
         "servers": rows
     })
 
@@ -326,5 +380,5 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 10000))
-        )
+    )
     
