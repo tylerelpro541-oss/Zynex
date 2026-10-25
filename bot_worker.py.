@@ -1,0 +1,36 @@
+import os
+import time
+import requests
+
+API_URL = os.getenv(
+    "ZYNEX_API_URL",
+    "https://zynex-kf4o.onrender.com"
+).rstrip("/")
+
+INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
+
+
+def check_backend():
+    try:
+        response = requests.get(
+            f"{API_URL}/",
+            timeout=30
+        )
+        response.raise_for_status()
+        print("ZYNEX backend:", response.json())
+        return True
+    except requests.RequestException as error:
+        print("Error de conexión:", error)
+        return False
+
+
+def main():
+    print("ZYNEX BOT WORKER iniciado")
+
+    while True:
+        check_backend()
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
