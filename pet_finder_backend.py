@@ -10,12 +10,16 @@ app = Flask(__name__)
 CORS(app)
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
-PLACE_ID = "107778070777162"
+PLACE_ID = "108053424714724"
+ROBLOX_SERVERS_URL = (
+    f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
+)
 
 
 def get_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL no configurada")
+
     return psycopg2.connect(
         DATABASE_URL,
         connect_timeout=8,
@@ -38,10 +42,12 @@ def init_db():
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS egg_reports_created_at_idx
                 ON egg_reports (created_at DESC)
             """)
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS public_servers (
                     place_id TEXT NOT NULL,
@@ -73,17 +79,26 @@ def json_row(row):
     return result
 
 
+def to_number(value):
+    try:
+        return float(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
 @app.get("/")
 def home():
     return jsonify({
         "ok": True,
         "service": "ZYNEX Pet Finder API",
         "storage": "postgresql",
+        "place_id": PLACE_ID,
         "features": [
             "reports",
             "servers",
             "health",
-            "public_servers"
+            "public_servers",
+            "sync_public_servers"
         ]
     })
 
@@ -99,6 +114,7 @@ def health():
             "ok": True,
             "database": "connected"
         })
+
     except Exception:
         app.logger.exception("Health check failed")
         return jsonify({
@@ -122,15 +138,11 @@ def reports():
                 "error": "name obligatorio"
             }), 400
 
-        def to_number(value):
-            try:
-                return float(value) if value not in (None, "") else None
-            except (TypeError, ValueError):
-                return None
-
         try:
             with get_conn() as conn:
-                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                with conn.cursor(
+                    cursor_factory=RealDictCursor
+                ) as cur:
                     cur.execute("""
                         INSERT INTO egg_reports
                         (name, rarity, weight, income, server_id, area)
@@ -140,12 +152,10 @@ def reports():
                         name[:200],
                         str(data.get("rarity") or "")[:50],
                         to_number(data.get(
-                            "weight_kg",
-                            data.get("weight")
+                            "weight_kg", data.get("weight")
                         )),
                         to_number(data.get(
-                            "income_per_second",
-                            data.get("income")
+                            "income_per_second", data.get("income")
                         )),
                         str(data.get("server_id") or "")[:200],
                         str(data.get("area") or "")[:200]
@@ -172,14 +182,16 @@ def reports():
 
     try:
         with get_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            with conn.cursor(
+                cursor_factory=RealDictCursor
+            ) as cur:
                 cur.execute("""
                     SELECT * FROM egg_reports
                     ORDER BY created_at DESC
                     LIMIT %s
                 """, (limit,))
 
-                rows = [json_row(r) for r in cur.fetchall()]
+                rows = [json_row(row) for row in cur.fetchall()]
 
         return jsonify(rows)
 
@@ -195,7 +207,9 @@ def reports():
 def servers():
     try:
         with get_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            with conn.cursor(
+                cursor_factory=RealDictCursor
+            ) as cur:
                 cur.execute("""
                     SELECT
                         server_id,
@@ -210,7 +224,7 @@ def servers():
                     LIMIT 200
                 """)
 
-                rows = [json_row(r) for r in cur.fetchall()]
+                rows = [json_row(row) for row in cur.fetchall()]
 
         return jsonify({
             "ok": True,
@@ -228,90 +242,96 @@ def servers():
 
 @app.get("/sync-public-servers")
 def sync_public_servers():
-    url = (
-        f"https://games.roblox.com/v1/games/"
-        f"{PLACE_ID}/servers/Public"
-    )
+    saved_count = 0
+    pages_read = 0
+    cursor = None
 
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                response = requests.get(
-                    url,
-                    params={
-                        "sortOrder": "Asc",
+                for _ in range(10):
+                    params = {
+                        "sortOrder": "Desc",
                         "limit": 100
-                    },
-                    timeout=20,
-                    headers={
-                        "User-Agent": "Mozilla/5.0",
-                        "Accept": "application/json"
                     }
-                )
 
-                if response.status_code == 429:
-                    retry_after = response.headers.get("Retry-After")
+                    if cursor:
+                        params["cursor"] = cursor
 
-                    app.logger.warning(
-                        "Roblox rate limit 429; Retry-After=%s",
-                        retry_after
+                    response = requests.get(
+                        ROBLOX_SERVERS_URL,
+                        params=params,
+                        timeout=20,
+                        headers={
+                            "User-Agent": "Mozilla/5.0",
+                            "Accept": "application/json"
+                        }
                     )
 
-                    return jsonify({
-                        "ok": False,
-                        "error": (
-                            "Roblox está limitando las peticiones. "
-                            "Espera antes de volver a intentar."
-                        ),
-                        "retry_after": retry_after
-                    }), 429
+                    if response.status_code == 429:
+                        return jsonify({
+                            "ok": False,
+                            "error": (
+                                "Roblox está limitando las consultas. "
+                                "Espera antes de reintentar."
+                            ),
+                            "retry_after": response.headers.get(
+                                "Retry-After"
+                            )
+                        }), 429
 
-                response.raise_for_status()
-                payload = response.json()
-                saved_count = 0
+                    response.raise_for_status()
+                    payload = response.json()
+                    pages_read += 1
 
-                for server in payload.get("data", []):
-                    server_id = server.get("id")
+                    for server in payload.get("data", []):
+                        server_id = server.get("id")
 
-                    if not server_id:
-                        continue
+                        if not server_id:
+                            continue
 
-                    cur.execute("""
-                        INSERT INTO public_servers
+                        cur.execute("""
+                            INSERT INTO public_servers
                             (place_id, server_id, playing,
                              max_players, updated_at)
-                        VALUES (%s, %s, %s, %s, NOW())
-                        ON CONFLICT (place_id, server_id)
-                        DO UPDATE SET
-                            playing = EXCLUDED.playing,
-                            max_players = EXCLUDED.max_players,
-                            updated_at = NOW()
-                    """, (
-                        PLACE_ID,
-                        str(server_id),
-                        int(server.get("playing") or 0),
-                        int(server.get("maxPlayers") or 0)
-                    ))
+                            VALUES (%s, %s, %s, %s, NOW())
+                            ON CONFLICT (place_id, server_id)
+                            DO UPDATE SET
+                                playing = EXCLUDED.playing,
+                                max_players = EXCLUDED.max_players,
+                                updated_at = NOW()
+                        """, (
+                            PLACE_ID,
+                            str(server_id),
+                            int(server.get("playing") or 0),
+                            int(server.get("maxPlayers") or 0)
+                        ))
 
-                    saved_count += 1
+                        saved_count += 1
+
+                    cursor = payload.get("nextPageCursor")
+
+                    if not cursor:
+                        break
 
         return jsonify({
             "ok": True,
+            "pages_read": pages_read,
             "saved_or_updated": saved_count,
-            "max_per_run": 100,
-            "note": (
-                "Se guardaron IDs públicos. "
-                "Esto no detecta los huevos de esos servidores."
+            "message": (
+                "Se guardaron los IDs públicos encontrados. "
+                "Esto no inicia clientes de Roblox ni detecta "
+                "criaturas dentro de esas partidas."
             )
         })
 
-    except requests.exceptions.HTTPError:
-        app.logger.exception("Roblox API HTTP error")
+    except requests.exceptions.RequestException:
+        app.logger.exception("Roblox server request failed")
         return jsonify({
             "ok": False,
             "error": (
-                "Roblox rechazó la petición. "
-                "Si es 429, espera antes de reintentar."
+                "No se pudo consultar Roblox. "
+                "Revisa los logs de Render e inténtalo después."
             )
         }), 502
 
@@ -332,7 +352,9 @@ def public_servers():
 
     try:
         with get_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            with conn.cursor(
+                cursor_factory=RealDictCursor
+            ) as cur:
                 cur.execute("""
                     SELECT server_id, playing, max_players, updated_at
                     FROM public_servers
@@ -341,7 +363,7 @@ def public_servers():
                     LIMIT %s
                 """, (PLACE_ID, limit))
 
-                rows = [json_row(r) for r in cur.fetchall()]
+                rows = [json_row(row) for row in cur.fetchall()]
 
         return jsonify({
             "ok": True,
@@ -368,5 +390,5 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", "10000"))
-        )
-                
+            )
+                    
