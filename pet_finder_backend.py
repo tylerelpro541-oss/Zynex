@@ -1,6 +1,4 @@
-
 import os
-import time
 import requests
 import psycopg2
 from contextlib import contextmanager
@@ -13,13 +11,13 @@ CORS(app)
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 PLACE_ID = "107778070777162"
+
 ROBLOX_API = (
     f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
 )
 
-# Tiempo máximo que un servidor se considera reciente en el filtro.
 DEFAULT_MAX_AGE_MINUTES = 60
-MAX_AGE_MINUTES = 10080  # 7 días
+MAX_AGE_MINUTES = 10080
 
 
 @contextmanager
@@ -32,6 +30,7 @@ def get_conn():
         sslmode="require",
         connect_timeout=10
     )
+
     try:
         yield conn
         conn.commit()
@@ -57,10 +56,12 @@ def init_db():
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
+
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS egg_reports_created_at_idx
                 ON egg_reports (created_at DESC)
             """)
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS public_servers (
                     place_id TEXT NOT NULL,
@@ -71,10 +72,12 @@ def init_db():
                     PRIMARY KEY (place_id, server_id)
                 )
             """)
+
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS public_servers_updated_idx
                 ON public_servers (place_id, updated_at DESC)
             """)
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS public_server_sync_state (
                     place_id TEXT PRIMARY KEY,
@@ -84,6 +87,7 @@ def init_db():
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
+
             cur.execute("""
                 INSERT INTO public_server_sync_state (place_id)
                 VALUES (%s)
@@ -120,9 +124,13 @@ def home():
             "public_servers_updated_last_hour": recent_count,
             "place_id": PLACE_ID
         })
+
     except Exception as e:
         app.logger.exception("Home error")
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({
+            "ok": False,
+            "error": str(e)
+        }), 500
 
 
 @app.route("/health")
@@ -131,7 +139,12 @@ def health():
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
-        return jsonify({"ok": True, "database": "connected"})
+
+        return jsonify({
+            "ok": True,
+            "database": "connected"
+        })
+
     except Exception as e:
         app.logger.exception("Health error")
         return jsonify({
@@ -164,16 +177,26 @@ def reports():
                     str(name),
                     data.get("rarity"),
                     data.get("weight", data.get("weight_kg")),
-                    data.get("income", data.get("income_per_second")),
+                    data.get(
+                        "income",
+                        data.get("income_per_second")
+                    ),
                     data.get("server_id"),
                     data.get("area")
                 ))
+
                 report_id = cur.fetchone()[0]
 
-        return jsonify({"ok": True, "id": report_id}), 201
+        return jsonify({
+            "ok": True,
+            "id": report_id
+        }), 201
 
     rarity = request.args.get("rarity", "ALL").upper()
-    limit = min(max(request.args.get("limit", 100, type=int), 1), 500)
+    limit = min(
+        max(request.args.get("limit", 100, type=int), 1),
+        500
+    )
 
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -198,6 +221,7 @@ def reports():
                     ORDER BY created_at DESC
                     LIMIT %s
                 """, (rarity, limit))
+
             rows = cur.fetchall()
 
     return jsonify(rows)
@@ -213,11 +237,13 @@ def servers():
                        COUNT(DISTINCT name) AS egg_types,
                        MAX(created_at) AS last_seen
                 FROM egg_reports
-                WHERE server_id IS NOT NULL AND server_id <> ''
+                WHERE server_id IS NOT NULL
+                  AND server_id <> ''
                 GROUP BY server_id
                 ORDER BY MAX(created_at) DESC
                 LIMIT 500
             """)
+
             rows = cur.fetchall()
 
     return jsonify({
@@ -238,6 +264,7 @@ def sync_public_servers():
                     WHERE place_id = %s
                     FOR UPDATE
                 """, (PLACE_ID,))
+
                 state = cur.fetchone()
 
                 if state is None:
@@ -245,7 +272,8 @@ def sync_public_servers():
                         INSERT INTO public_server_sync_state (place_id)
                         VALUES (%s)
                         ON CONFLICT (place_id) DO NOTHING
-                    """, (PLACE_ID,))
+                    """)
+
                     cursor_token = None
                     pages_read = 0
                     total_seen = 0
@@ -258,6 +286,7 @@ def sync_public_servers():
                     "sortOrder": "Asc",
                     "limit": 100
                 }
+
                 if cursor_token:
                     params["cursor"] = cursor_token
 
@@ -270,6 +299,7 @@ def sync_public_servers():
 
                 if response.status_code == 429:
                     retry_after = response.headers.get("Retry-After")
+
                     try:
                         retry_seconds = max(5, int(retry_after))
                     except (TypeError, ValueError):
@@ -298,8 +328,10 @@ def sync_public_servers():
                 next_cursor = payload.get("nextPageCursor")
 
                 saved = 0
+
                 for server in server_list:
                     server_id = server.get("id")
+
                     if not server_id:
                         continue
 
@@ -319,17 +351,18 @@ def sync_public_servers():
                         server.get("playing", 0),
                         server.get("maxPlayers", 0)
                     ))
+
                     saved += 1
 
                 pages_read += 1
                 total_seen += len(server_list)
 
-                # Limpia registros que llevan más de 7 días sin actualizarse.
                 cur.execute("""
                     DELETE FROM public_servers
                     WHERE place_id = %s
                       AND updated_at < NOW() - INTERVAL '7 days'
                 """, (PLACE_ID,))
+
                 deleted_stale = cur.rowcount
 
                 if not next_cursor:
@@ -341,6 +374,7 @@ def sync_public_servers():
                             updated_at = NOW()
                         WHERE place_id = %s
                     """, (PLACE_ID,))
+
                     finished = True
                 else:
                     cur.execute("""
@@ -356,6 +390,7 @@ def sync_public_servers():
                         total_seen,
                         PLACE_ID
                     ))
+
                     finished = False
 
         return jsonify({
@@ -366,7 +401,9 @@ def sync_public_servers():
             "saved_or_updated": saved,
             "stale_records_deleted": deleted_stale,
             "pages_in_cycle": pages_read if not finished else 0,
-            "total_seen_in_cycle": total_seen if not finished else len(server_list),
+            "total_seen_in_cycle": (
+                total_seen if not finished else len(server_list)
+            ),
             "more_pages": bool(next_cursor),
             "cycle_finished": finished
         })
@@ -378,25 +415,37 @@ def sync_public_servers():
             "error": "No se pudo conectar con Roblox",
             "details": str(e)
         }), 502
+
     except Exception as e:
         app.logger.exception("Public server sync failed")
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({
+            "ok": False,
+            "error": str(e)
+        }), 500
 
 
 @app.route("/public-servers")
 def public_servers():
     min_players = request.args.get("min_players", 1, type=int)
     max_players = request.args.get("max_players", 4, type=int)
+
     max_age_minutes = request.args.get(
         "max_age_minutes",
         DEFAULT_MAX_AGE_MINUTES,
         type=int
     )
-    limit = min(max(request.args.get("limit", 500, type=int), 1), 1000)
+
+    limit = min(
+        max(request.args.get("limit", 500, type=int), 1),
+        1000
+    )
 
     min_players = max(0, min_players)
     max_players = max(min_players, max_players)
-    max_age_minutes = min(max(1, max_age_minutes), MAX_AGE_MINUTES)
+    max_age_minutes = min(
+        max(1, max_age_minutes),
+        MAX_AGE_MINUTES
+    )
 
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -416,6 +465,7 @@ def public_servers():
                 max_age_minutes,
                 limit
             ))
+
             rows = cur.fetchall()
 
     return jsonify({
@@ -431,6 +481,70 @@ def public_servers():
     })
 
 
+@app.route("/test-server-data")
+def test_server_data():
+    try:
+        response = requests.get(
+            ROBLOX_API,
+            params={
+                "sortOrder": "Asc",
+                "limit": 10
+            },
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15
+        )
+
+        if response.status_code == 429:
+            return jsonify({
+                "ok": False,
+                "error": "Roblox está limitando las solicitudes",
+                "http_status": 429,
+                "message": "Espera antes de volver a probar."
+            }), 429
+
+        if response.status_code != 200:
+            return jsonify({
+                "ok": False,
+                "error": "Roblox rechazó la solicitud",
+                "http_status": response.status_code
+            }), 502
+
+        payload = response.json()
+        server_list = payload.get("data", [])
+
+        available_fields = (
+            sorted(server_list[0].keys())
+            if server_list else []
+        )
+
+        return jsonify({
+            "ok": True,
+            "place_id": PLACE_ID,
+            "servers_found": len(server_list),
+            "available_fields": available_fields,
+            "creature_data_available": False,
+            "message": (
+                "La API pública devuelve información de servidores, "
+                "pero esta respuesta no incluye las criaturas que "
+                "hay dentro de cada partida."
+            )
+        })
+
+    except requests.RequestException:
+        app.logger.exception("Server data test failed")
+        return jsonify({
+            "ok": False,
+            "error": "No se pudo conectar con Roblox"
+        }), 502
+
+    except Exception as e:
+        app.logger.exception("Server data test error")
+        return jsonify({
+            "ok": False,
+            "error": str(e)
+        }), 500
+
+
 with app.app_context():
     init_db()
 
@@ -440,4 +554,3 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 10000))
         )
-                        
