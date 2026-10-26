@@ -1,7 +1,9 @@
+
 import os
 import time
 import requests
 import psycopg2
+from contextlib import contextmanager
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from psycopg2.extras import RealDictCursor
@@ -15,11 +17,29 @@ ROBLOX_API = (
     f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
 )
 
+# Tiempo máximo que un servidor se considera reciente en el filtro.
+DEFAULT_MAX_AGE_MINUTES = 60
+MAX_AGE_MINUTES = 10080  # 7 días
 
+
+@contextmanager
 def get_conn():
     if not DATABASE_URL:
         raise RuntimeError("Falta DATABASE_URL en Render")
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+    conn = psycopg2.connect(
+        DATABASE_URL,
+        sslmode="require",
+        connect_timeout=10
+    )
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db():
@@ -52,6 +72,10 @@ def init_db():
                 )
             """)
             cur.execute("""
+                CREATE INDEX IF NOT EXISTS public_servers_updated_idx
+                ON public_servers (place_id, updated_at DESC)
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS public_server_sync_state (
                     place_id TEXT PRIMARY KEY,
                     next_cursor TEXT,
@@ -74,17 +98,26 @@ def home():
             with conn.cursor() as cur:
                 cur.execute("SELECT COUNT(*) FROM egg_reports")
                 report_count = cur.fetchone()[0]
+
                 cur.execute("""
                     SELECT COUNT(*) FROM public_servers
                     WHERE place_id = %s
                 """, (PLACE_ID,))
                 server_count = cur.fetchone()[0]
 
+                cur.execute("""
+                    SELECT COUNT(*) FROM public_servers
+                    WHERE place_id = %s
+                      AND updated_at >= NOW() - INTERVAL '60 minutes'
+                """, (PLACE_ID,))
+                recent_count = cur.fetchone()[0]
+
         return jsonify({
             "service": "PET Finder | ZYNEX",
             "status": "online",
             "reports": report_count,
             "public_servers_saved": server_count,
+            "public_servers_updated_last_hour": recent_count,
             "place_id": PLACE_ID
         })
     except Exception as e:
@@ -100,6 +133,7 @@ def health():
                 cur.execute("SELECT 1")
         return jsonify({"ok": True, "database": "connected"})
     except Exception as e:
+        app.logger.exception("Health error")
         return jsonify({
             "ok": False,
             "database": "error",
@@ -195,9 +229,6 @@ def servers():
 
 @app.route("/sync-public-servers", methods=["GET", "POST"])
 def sync_public_servers():
-    # Cada llamada procesa solamente una página.
-    # El cursor queda guardado en PostgreSQL para continuar
-    # en la siguiente llamada, incluso tras reiniciar Render.
     try:
         with get_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -223,7 +254,10 @@ def sync_public_servers():
                     pages_read = state["pages_read"]
                     total_seen = state["total_seen"]
 
-                params = {"sortOrder": "Desc", "limit": 100}
+                params = {
+                    "sortOrder": "Asc",
+                    "limit": 100
+                }
                 if cursor_token:
                     params["cursor"] = cursor_token
 
@@ -231,13 +265,13 @@ def sync_public_servers():
                     ROBLOX_API,
                     params=params,
                     headers={"User-Agent": "Mozilla/5.0"},
-                    timeout=15
+                    timeout=20
                 )
 
                 if response.status_code == 429:
                     retry_after = response.headers.get("Retry-After")
                     try:
-                        retry_seconds = int(retry_after) if retry_after else 60
+                        retry_seconds = max(5, int(retry_after))
                     except (TypeError, ValueError):
                         retry_seconds = 60
 
@@ -290,8 +324,14 @@ def sync_public_servers():
                 pages_read += 1
                 total_seen += len(server_list)
 
-                # Cuando termina una vuelta, la siguiente comienza
-                # desde la primera página.
+                # Limpia registros que llevan más de 7 días sin actualizarse.
+                cur.execute("""
+                    DELETE FROM public_servers
+                    WHERE place_id = %s
+                      AND updated_at < NOW() - INTERVAL '7 days'
+                """, (PLACE_ID,))
+                deleted_stale = cur.rowcount
+
                 if not next_cursor:
                     cur.execute("""
                         UPDATE public_server_sync_state
@@ -324,6 +364,7 @@ def sync_public_servers():
             "pages_read_this_request": 1,
             "servers_in_this_page": len(server_list),
             "saved_or_updated": saved,
+            "stale_records_deleted": deleted_stale,
             "pages_in_cycle": pages_read if not finished else 0,
             "total_seen_in_cycle": total_seen if not finished else len(server_list),
             "more_pages": bool(next_cursor),
@@ -344,9 +385,18 @@ def sync_public_servers():
 
 @app.route("/public-servers")
 def public_servers():
-    min_players = request.args.get("min_players", 3, type=int)
+    min_players = request.args.get("min_players", 1, type=int)
     max_players = request.args.get("max_players", 4, type=int)
+    max_age_minutes = request.args.get(
+        "max_age_minutes",
+        DEFAULT_MAX_AGE_MINUTES,
+        type=int
+    )
     limit = min(max(request.args.get("limit", 500, type=int), 1), 1000)
+
+    min_players = max(0, min_players)
+    max_players = max(min_players, max_players)
+    max_age_minutes = min(max(1, max_age_minutes), MAX_AGE_MINUTES)
 
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -355,9 +405,17 @@ def public_servers():
                 FROM public_servers
                 WHERE place_id = %s
                   AND playing BETWEEN %s AND %s
+                  AND updated_at >=
+                      NOW() - (%s * INTERVAL '1 minute')
                 ORDER BY updated_at DESC
                 LIMIT %s
-            """, (PLACE_ID, min_players, max_players, limit))
+            """, (
+                PLACE_ID,
+                min_players,
+                max_players,
+                max_age_minutes,
+                limit
+            ))
             rows = cur.fetchall()
 
     return jsonify({
@@ -366,7 +424,8 @@ def public_servers():
         "count": len(rows),
         "filter": {
             "min_players": min_players,
-            "max_players": max_players
+            "max_players": max_players,
+            "max_age_minutes": max_age_minutes
         },
         "servers": rows
     })
@@ -380,5 +439,5 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 10000))
-    )
-    
+        )
+                        
