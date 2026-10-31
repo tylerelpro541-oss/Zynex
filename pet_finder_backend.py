@@ -1,556 +1,311 @@
 import os
-import requests
-import psycopg2
-from contextlib import contextmanager
+import hashlib
+from datetime import datetime, timezone
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+import psycopg2
 from psycopg2.extras import RealDictCursor
 
 app = Flask(__name__)
 CORS(app)
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
-PLACE_ID = "107778070777162"
-
-ROBLOX_API = (
-    f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
-)
-
-DEFAULT_MAX_AGE_MINUTES = 60
-MAX_AGE_MINUTES = 10080
+DATABASE_URL = os.environ["DATABASE_URL"]
+READER_TOKEN = os.getenv("READER_TOKEN", "")
 
 
-@contextmanager
-def get_conn():
-    if not DATABASE_URL:
-        raise RuntimeError("Falta DATABASE_URL en Render")
-
-    conn = psycopg2.connect(
+def db():
+    return psycopg2.connect(
         DATABASE_URL,
         sslmode="require",
-        connect_timeout=10
+        cursor_factory=RealDictCursor
     )
-
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
 
 
 def init_db():
-    with get_conn() as conn:
+    with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS egg_reports (
                     id BIGSERIAL PRIMARY KEY,
                     name TEXT NOT NULL,
-                    rarity TEXT,
+                    rarity TEXT DEFAULT 'Unknown',
                     weight DOUBLE PRECISION,
                     income DOUBLE PRECISION,
-                    server_id TEXT,
-                    area TEXT,
+                    server_id TEXT DEFAULT 'unknown',
+                    area TEXT DEFAULT 'unknown',
+                    reader_id TEXT DEFAULT 'default',
+                    report_key TEXT,
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
-
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS egg_reports_created_at_idx
-                ON egg_reports (created_at DESC)
-            """)
-
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public_servers (
-                    place_id TEXT NOT NULL,
-                    server_id TEXT NOT NULL,
-                    playing INTEGER NOT NULL DEFAULT 0,
-                    max_players INTEGER NOT NULL DEFAULT 0,
-                    updated_at TIMESTAMPTZ DEFAULT NOW(),
-                    PRIMARY KEY (place_id, server_id)
+                CREATE TABLE IF NOT EXISTS egg_readers (
+                    reader_id TEXT PRIMARY KEY,
+                    server_id TEXT DEFAULT 'unknown',
+                    place_id TEXT DEFAULT 'unknown',
+                    last_seen TIMESTAMPTZ DEFAULT NOW(),
+                    reports_sent BIGINT DEFAULT 0
                 )
             """)
-
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS public_servers_updated_idx
-                ON public_servers (place_id, updated_at DESC)
+                CREATE INDEX IF NOT EXISTS egg_reports_created_idx
+                ON egg_reports(created_at DESC)
             """)
-
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public_server_sync_state (
-                    place_id TEXT PRIMARY KEY,
-                    next_cursor TEXT,
-                    pages_read INTEGER NOT NULL DEFAULT 0,
-                    total_seen BIGINT NOT NULL DEFAULT 0,
-                    updated_at TIMESTAMPTZ DEFAULT NOW()
-                )
-            """)
-
-            cur.execute("""
-                INSERT INTO public_server_sync_state (place_id)
-                VALUES (%s)
-                ON CONFLICT (place_id) DO NOTHING
-            """, (PLACE_ID,))
+        conn.commit()
 
 
-@app.route("/")
+def authorized():
+    return (
+        not READER_TOKEN
+        or request.headers.get("X-Reader-Token") == READER_TOKEN
+    )
+
+
+def clean(value, default="unknown"):
+    value = str(value or "").strip()
+    return value[:180] if value else default
+
+
+@app.get("/")
 def home():
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM egg_reports")
-                report_count = cur.fetchone()[0]
-
-                cur.execute("""
-                    SELECT COUNT(*) FROM public_servers
-                    WHERE place_id = %s
-                """, (PLACE_ID,))
-                server_count = cur.fetchone()[0]
-
-                cur.execute("""
-                    SELECT COUNT(*) FROM public_servers
-                    WHERE place_id = %s
-                      AND updated_at >= NOW() - INTERVAL '60 minutes'
-                """, (PLACE_ID,))
-                recent_count = cur.fetchone()[0]
-
-        return jsonify({
-            "service": "PET Finder | ZYNEX",
-            "status": "online",
-            "reports": report_count,
-            "public_servers_saved": server_count,
-            "public_servers_updated_last_hour": recent_count,
-            "place_id": PLACE_ID
-        })
-
-    except Exception as e:
-        app.logger.exception("Home error")
-        return jsonify({
-            "ok": False,
-            "error": str(e)
-        }), 500
+    return jsonify({
+        "service": "PET Finder | ZYNEX",
+        "status": "online"
+    })
 
 
-@app.route("/health")
+@app.get("/health")
 def health():
     try:
-        with get_conn() as conn:
+        with db() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
-
-        return jsonify({
-            "ok": True,
-            "database": "connected"
-        })
-
-    except Exception as e:
-        app.logger.exception("Health error")
-        return jsonify({
-            "ok": False,
-            "database": "error",
-            "error": str(e)
-        }), 500
+        return jsonify({"ok": True, "database": "connected"})
+    except Exception:
+        return jsonify({"ok": False, "database": "disconnected"}), 503
 
 
 @app.route("/reports", methods=["GET", "POST"])
 def reports():
+
     if request.method == "POST":
+
+        if not authorized():
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
         data = request.get_json(silent=True) or {}
-        name = data.get("name")
 
+        name = clean(data.get("name"), "")
         if not name:
-            return jsonify({
-                "ok": False,
-                "error": "Falta el campo name"
-            }), 400
+            return jsonify({"ok": False, "error": "name_required"}), 400
 
-        with get_conn() as conn:
+        rarity = clean(data.get("rarity"))
+        server = clean(data.get("server_id"))
+        area = clean(data.get("area"))
+        reader = clean(data.get("reader_id"), "default")
+
+        try:
+            weight = data.get("weight", data.get("weight_kg"))
+            income = data.get("income", data.get("income_per_second"))
+
+            weight = float(weight) if weight not in (None, "") else None
+            income = float(income) if income not in (None, "") else None
+
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "error": "invalid_numbers"}), 400
+
+        raw = f"{name}|{rarity}|{server}|{area}|{weight}|{income}"
+        report_key = hashlib.sha256(raw.encode()).hexdigest()
+
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+
+                    cur.execute("""
+                        SELECT id FROM egg_reports
+                        WHERE report_key = %s
+                        AND created_at > NOW() - INTERVAL '30 seconds'
+                        LIMIT 1
+                    """, (report_key,))
+
+                    duplicate = cur.fetchone()
+
+                    if duplicate:
+                        return jsonify({
+                            "ok": True,
+                            "duplicate": True,
+                            "id": duplicate["id"]
+                        })
+
+                    cur.execute("""
+                        INSERT INTO egg_reports
+                        (name, rarity, weight, income, server_id,
+                         area, reader_id, report_key)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                        RETURNING id
+                    """, (
+                        name, rarity, weight, income,
+                        server, area, reader, report_key
+                    ))
+
+                    saved = cur.fetchone()
+
+                    cur.execute("""
+                        INSERT INTO egg_readers
+                        (reader_id, server_id, last_seen, reports_sent)
+                        VALUES (%s,%s,NOW(),1)
+                        ON CONFLICT (reader_id)
+                        DO UPDATE SET
+                            server_id = EXCLUDED.server_id,
+                            last_seen = NOW(),
+                            reports_sent = egg_readers.reports_sent + 1
+                    """, (reader, server))
+
+                conn.commit()
+
+            return jsonify({
+                "ok": True,
+                "id": saved["id"]
+            }), 201
+
+        except Exception:
+            app.logger.exception("Report save failed")
+            return jsonify({"ok": False, "error": "database_error"}), 500
+
+    rarity = request.args.get("rarity", "ALL")
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+
+                if rarity.upper() == "ALL":
+                    cur.execute("""
+                        SELECT id, name, rarity, weight,
+                               weight AS weight_kg,
+                               income, income AS income_per_second,
+                               server_id, area, reader_id, created_at
+                        FROM egg_reports
+                        ORDER BY created_at DESC
+                        LIMIT 1000
+                    """)
+                else:
+                    cur.execute("""
+                        SELECT id, name, rarity, weight,
+                               weight AS weight_kg,
+                               income, income AS income_per_second,
+                               server_id, area, reader_id, created_at
+                        FROM egg_reports
+                        WHERE UPPER(rarity) = UPPER(%s)
+                        ORDER BY created_at DESC
+                        LIMIT 1000
+                    """, (rarity,))
+
+                rows = cur.fetchall()
+
+        for row in rows:
+            row["created_at"] = row["created_at"].isoformat()
+
+        return jsonify(rows)
+
+    except Exception:
+        app.logger.exception("Report fetch failed")
+        return jsonify({"ok": False, "error": "database_error"}), 500
+
+
+@app.route("/readers", methods=["GET", "POST"])
+def readers():
+
+    if request.method == "POST":
+
+        if not authorized():
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+        data = request.get_json(silent=True) or {}
+
+        reader = clean(data.get("reader_id"), "")
+        if not reader:
+            return jsonify({"ok": False, "error": "reader_id_required"}), 400
+
+        server = clean(data.get("server_id"))
+        place = clean(data.get("place_id"))
+
+        with db() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO egg_reports
-                        (name, rarity, weight, income, server_id, area)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    RETURNING id
-                """, (
-                    str(name),
-                    data.get("rarity"),
-                    data.get("weight", data.get("weight_kg")),
-                    data.get(
-                        "income",
-                        data.get("income_per_second")
-                    ),
-                    data.get("server_id"),
-                    data.get("area")
-                ))
+                    INSERT INTO egg_readers
+                    (reader_id, server_id, place_id, last_seen)
+                    VALUES (%s,%s,%s,NOW())
+                    ON CONFLICT (reader_id)
+                    DO UPDATE SET
+                        server_id = EXCLUDED.server_id,
+                        place_id = EXCLUDED.place_id,
+                        last_seen = NOW()
+                """, (reader, server, place))
+            conn.commit()
 
-                report_id = cur.fetchone()[0]
+        return jsonify({"ok": True, "reader_id": reader})
 
-        return jsonify({
-            "ok": True,
-            "id": report_id
-        }), 201
-
-    rarity = request.args.get("rarity", "ALL").upper()
-    limit = min(
-        max(request.args.get("limit", 100, type=int), 1),
-        500
-    )
-
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if rarity == "ALL":
-                cur.execute("""
-                    SELECT id, name, rarity, weight,
-                           weight AS weight_kg, income,
-                           income AS income_per_second,
-                           server_id, area, created_at
-                    FROM egg_reports
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                """, (limit,))
-            else:
-                cur.execute("""
-                    SELECT id, name, rarity, weight,
-                           weight AS weight_kg, income,
-                           income AS income_per_second,
-                           server_id, area, created_at
-                    FROM egg_reports
-                    WHERE UPPER(rarity) = %s
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                """, (rarity, limit))
-
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT reader_id, server_id, place_id,
+                       last_seen, reports_sent
+                FROM egg_readers
+                ORDER BY last_seen DESC
+            """)
             rows = cur.fetchall()
 
-    return jsonify(rows)
+    now = datetime.now(timezone.utc)
+
+    for row in rows:
+        last = row["last_seen"]
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+
+        row["status"] = (
+            "online" if (now - last).total_seconds() < 90
+            else "offline"
+        )
+        row["last_seen"] = last.isoformat()
+
+    return jsonify({
+        "ok": True,
+        "readers": rows,
+        "readers_count": len(rows)
+    })
 
 
-@app.route("/servers")
+@app.get("/servers")
 def servers():
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+
+    with db() as conn:
+        with conn.cursor() as cur:
             cur.execute("""
                 SELECT server_id,
                        COUNT(*) AS report_count,
                        COUNT(DISTINCT name) AS egg_types,
                        MAX(created_at) AS last_seen
                 FROM egg_reports
-                WHERE server_id IS NOT NULL
-                  AND server_id <> ''
                 GROUP BY server_id
-                ORDER BY MAX(created_at) DESC
-                LIMIT 500
+                ORDER BY last_seen DESC
             """)
-
             rows = cur.fetchall()
+
+    for row in rows:
+        row["last_seen"] = row["last_seen"].isoformat()
 
     return jsonify({
         "ok": True,
-        "servers_count": len(rows),
-        "servers": rows
+        "servers": rows,
+        "servers_count": len(rows)
     })
 
 
-@app.route("/sync-public-servers", methods=["GET", "POST"])
-def sync_public_servers():
-    try:
-        with get_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""
-                    SELECT next_cursor, pages_read, total_seen
-                    FROM public_server_sync_state
-                    WHERE place_id = %s
-                    FOR UPDATE
-                """, (PLACE_ID,))
-
-                state = cur.fetchone()
-
-                if state is None:
-                    cur.execute("""
-                        INSERT INTO public_server_sync_state (place_id)
-                        VALUES (%s)
-                        ON CONFLICT (place_id) DO NOTHING
-                    """)
-
-                    cursor_token = None
-                    pages_read = 0
-                    total_seen = 0
-                else:
-                    cursor_token = state["next_cursor"]
-                    pages_read = state["pages_read"]
-                    total_seen = state["total_seen"]
-
-                params = {
-                    "sortOrder": "Asc",
-                    "limit": 100
-                }
-
-                if cursor_token:
-                    params["cursor"] = cursor_token
-
-                response = requests.get(
-                    ROBLOX_API,
-                    params=params,
-                    headers={"User-Agent": "Mozilla/5.0"},
-                    timeout=20
-                )
-
-                if response.status_code == 429:
-                    retry_after = response.headers.get("Retry-After")
-
-                    try:
-                        retry_seconds = max(5, int(retry_after))
-                    except (TypeError, ValueError):
-                        retry_seconds = 60
-
-                    return jsonify({
-                        "ok": False,
-                        "error": "Roblox está limitando las solicitudes",
-                        "http_status": 429,
-                        "retry_after_seconds": retry_seconds,
-                        "pages_read": pages_read,
-                        "total_seen": total_seen
-                    }), 429
-
-                if response.status_code != 200:
-                    return jsonify({
-                        "ok": False,
-                        "error": "Roblox rechazó la solicitud",
-                        "http_status": response.status_code,
-                        "pages_read": pages_read,
-                        "total_seen": total_seen
-                    }), 502
-
-                payload = response.json()
-                server_list = payload.get("data", [])
-                next_cursor = payload.get("nextPageCursor")
-
-                saved = 0
-
-                for server in server_list:
-                    server_id = server.get("id")
-
-                    if not server_id:
-                        continue
-
-                    cur.execute("""
-                        INSERT INTO public_servers
-                            (place_id, server_id, playing,
-                             max_players, updated_at)
-                        VALUES (%s, %s, %s, %s, NOW())
-                        ON CONFLICT (place_id, server_id)
-                        DO UPDATE SET
-                            playing = EXCLUDED.playing,
-                            max_players = EXCLUDED.max_players,
-                            updated_at = NOW()
-                    """, (
-                        PLACE_ID,
-                        server_id,
-                        server.get("playing", 0),
-                        server.get("maxPlayers", 0)
-                    ))
-
-                    saved += 1
-
-                pages_read += 1
-                total_seen += len(server_list)
-
-                cur.execute("""
-                    DELETE FROM public_servers
-                    WHERE place_id = %s
-                      AND updated_at < NOW() - INTERVAL '7 days'
-                """, (PLACE_ID,))
-
-                deleted_stale = cur.rowcount
-
-                if not next_cursor:
-                    cur.execute("""
-                        UPDATE public_server_sync_state
-                        SET next_cursor = NULL,
-                            pages_read = 0,
-                            total_seen = 0,
-                            updated_at = NOW()
-                        WHERE place_id = %s
-                    """, (PLACE_ID,))
-
-                    finished = True
-                else:
-                    cur.execute("""
-                        UPDATE public_server_sync_state
-                        SET next_cursor = %s,
-                            pages_read = %s,
-                            total_seen = %s,
-                            updated_at = NOW()
-                        WHERE place_id = %s
-                    """, (
-                        next_cursor,
-                        pages_read,
-                        total_seen,
-                        PLACE_ID
-                    ))
-
-                    finished = False
-
-        return jsonify({
-            "ok": True,
-            "place_id": PLACE_ID,
-            "pages_read_this_request": 1,
-            "servers_in_this_page": len(server_list),
-            "saved_or_updated": saved,
-            "stale_records_deleted": deleted_stale,
-            "pages_in_cycle": pages_read if not finished else 0,
-            "total_seen_in_cycle": (
-                total_seen if not finished else len(server_list)
-            ),
-            "more_pages": bool(next_cursor),
-            "cycle_finished": finished
-        })
-
-    except requests.RequestException as e:
-        app.logger.warning("Roblox request failed: %s", e)
-        return jsonify({
-            "ok": False,
-            "error": "No se pudo conectar con Roblox",
-            "details": str(e)
-        }), 502
-
-    except Exception as e:
-        app.logger.exception("Public server sync failed")
-        return jsonify({
-            "ok": False,
-            "error": str(e)
-        }), 500
-
-
-@app.route("/public-servers")
-def public_servers():
-    min_players = request.args.get("min_players", 1, type=int)
-    max_players = request.args.get("max_players", 4, type=int)
-
-    max_age_minutes = request.args.get(
-        "max_age_minutes",
-        DEFAULT_MAX_AGE_MINUTES,
-        type=int
-    )
-
-    limit = min(
-        max(request.args.get("limit", 500, type=int), 1),
-        1000
-    )
-
-    min_players = max(0, min_players)
-    max_players = max(min_players, max_players)
-    max_age_minutes = min(
-        max(1, max_age_minutes),
-        MAX_AGE_MINUTES
-    )
-
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT server_id, playing, max_players, updated_at
-                FROM public_servers
-                WHERE place_id = %s
-                  AND playing BETWEEN %s AND %s
-                  AND updated_at >=
-                      NOW() - (%s * INTERVAL '1 minute')
-                ORDER BY updated_at DESC
-                LIMIT %s
-            """, (
-                PLACE_ID,
-                min_players,
-                max_players,
-                max_age_minutes,
-                limit
-            ))
-
-            rows = cur.fetchall()
-
-    return jsonify({
-        "ok": True,
-        "place_id": PLACE_ID,
-        "count": len(rows),
-        "filter": {
-            "min_players": min_players,
-            "max_players": max_players,
-            "max_age_minutes": max_age_minutes
-        },
-        "servers": rows
-    })
-
-
-@app.route("/test-server-data")
-def test_server_data():
-    try:
-        response = requests.get(
-            ROBLOX_API,
-            params={
-                "sortOrder": "Asc",
-                "limit": 10
-            },
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=15
-        )
-
-        if response.status_code == 429:
-            return jsonify({
-                "ok": False,
-                "error": "Roblox está limitando las solicitudes",
-                "http_status": 429,
-                "message": "Espera antes de volver a probar."
-            }), 429
-
-        if response.status_code != 200:
-            return jsonify({
-                "ok": False,
-                "error": "Roblox rechazó la solicitud",
-                "http_status": response.status_code
-            }), 502
-
-        payload = response.json()
-        server_list = payload.get("data", [])
-
-        available_fields = (
-            sorted(server_list[0].keys())
-            if server_list else []
-        )
-
-        return jsonify({
-            "ok": True,
-            "place_id": PLACE_ID,
-            "servers_found": len(server_list),
-            "available_fields": available_fields,
-            "creature_data_available": False,
-            "message": (
-                "La API pública devuelve información de servidores, "
-                "pero esta respuesta no incluye las criaturas que "
-                "hay dentro de cada partida."
-            )
-        })
-
-    except requests.RequestException:
-        app.logger.exception("Server data test failed")
-        return jsonify({
-            "ok": False,
-            "error": "No se pudo conectar con Roblox"
-        }), 502
-
-    except Exception as e:
-        app.logger.exception("Server data test error")
-        return jsonify({
-            "ok": False,
-            "error": str(e)
-        }), 500
-
-
-with app.app_context():
-    init_db()
-
+init_db()
 
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000))
-        )
+        port=int(os.getenv("PORT", "10000"))
+    )
