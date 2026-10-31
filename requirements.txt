@@ -1,6 +1,4 @@
-
-flask
+Flask
 flask-cors
-psycopg2-binary
 gunicorn
-requests
+psycopg2-binary
